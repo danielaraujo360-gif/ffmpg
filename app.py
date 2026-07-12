@@ -1,8 +1,10 @@
+import base64
 import os
 import shutil
 import subprocess
 import tempfile
 import uuid
+from typing import Optional
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
@@ -19,7 +21,8 @@ app = FastAPI()
 
 
 class RenderRequest(BaseModel):
-    image_url: str
+    image_url: Optional[str] = None
+    image_b64: Optional[str] = None
     phrase: str
     music_url: str
     duration: float = 7.5
@@ -35,6 +38,9 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
     if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
         raise HTTPException(status_code=401, detail="unauthorized")
 
+    if not req.image_url and not req.image_b64:
+        raise HTTPException(status_code=422, detail="either image_url or image_b64 is required")
+
     workdir = tempfile.mkdtemp(prefix="render_")
     try:
         bg_path = os.path.join(workdir, "bg.jpg")
@@ -42,7 +48,11 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
         overlay_path = os.path.join(workdir, "overlay.png")
         output_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp4")
 
-        _download(req.image_url, bg_path)
+        if req.image_b64:
+            with open(bg_path, "wb") as f:
+                f.write(base64.b64decode(req.image_b64))
+        else:
+            _download(req.image_url, bg_path)
         _download(req.music_url, music_path)
 
         overlay_img = _create_text_overlay(req.phrase)
