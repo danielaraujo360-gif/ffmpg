@@ -1,0 +1,149 @@
+import os
+import shutil
+import subprocess
+import tempfile
+import uuid
+
+import requests
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
+from PIL import Image, ImageDraw, ImageFont
+from pydantic import BaseModel
+from starlette.background import BackgroundTask
+
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+WIDTH, HEIGHT = 1080, 1920
+
+app = FastAPI()
+
+
+class RenderRequest(BaseModel):
+    image_url: str
+    phrase: str
+    music_url: str
+    duration: float = 7.5
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/render")
+def render(req: RenderRequest, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    workdir = tempfile.mkdtemp(prefix="render_")
+    try:
+        bg_path = os.path.join(workdir, "bg.jpg")
+        music_path = os.path.join(workdir, "music" + _guess_ext(req.music_url))
+        overlay_path = os.path.join(workdir, "overlay.png")
+        output_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp4")
+
+        _download(req.image_url, bg_path)
+        _download(req.music_url, music_path)
+
+        overlay_img = _create_text_overlay(req.phrase)
+        overlay_img.save(overlay_path)
+
+        _run_ffmpeg(bg_path, overlay_path, music_path, output_path, req.duration)
+
+        return FileResponse(
+            output_path,
+            media_type="video/mp4",
+            filename="reel.mp4",
+            background=BackgroundTask(shutil.rmtree, workdir, ignore_errors=True),
+        )
+    except HTTPException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _guess_ext(url: str) -> str:
+    path = url.split("?")[0]
+    ext = os.path.splitext(path)[1]
+    return ext if ext else ".mp3"
+
+
+def _download(url: str, dest: str) -> None:
+    r = requests.get(url, stream=True, timeout=60)
+    r.raise_for_status()
+    with open(dest, "wb") as f:
+        for chunk in r.iter_content(8192):
+            f.write(chunk)
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        test = f"{current} {word}".strip()
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] - bbox[0] <= max_width or not current:
+            current = test
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _create_text_overlay(phrase: str) -> Image.Image:
+    img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    font_size = 72
+    max_text_width = int(WIDTH * 0.85)
+    font = ImageFont.truetype(FONT_PATH, font_size)
+    lines = _wrap_text(draw, phrase, font, max_text_width)
+
+    while len(lines) > 4 and font_size > 40:
+        font_size -= 4
+        font = ImageFont.truetype(FONT_PATH, font_size)
+        lines = _wrap_text(draw, phrase, font, max_text_width)
+
+    line_heights = [draw.textbbox((0, 0), line, font=font)[3] for line in lines]
+    total_height = sum(line_heights) + (len(lines) - 1) * 20
+    y = int(HEIGHT * 0.55) - total_height // 2
+
+    for line, line_height in zip(lines, line_heights):
+        bbox = draw.textbbox((0, 0), line, font=font)
+        x = (WIDTH - (bbox[2] - bbox[0])) // 2
+        draw.text((x, y), line, font=font, fill="white", stroke_width=4, stroke_fill="black")
+        y += line_height + 20
+
+    return img
+
+
+def _run_ffmpeg(bg_path: str, overlay_path: str, music_path: str, output_path: str, duration: float) -> None:
+    fade_dur = 1.2
+    text_start = fade_dur + 0.1
+    audio_fade_out_start = max(duration - 0.5, 0)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-t", str(duration), "-i", bg_path,
+        "-loop", "1", "-t", str(duration), "-i", overlay_path,
+        "-i", music_path,
+        "-filter_complex",
+        f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={WIDTH}:{HEIGHT},fade=t=in:st=0:d={fade_dur}[bg];"
+        f"[bg][1:v]overlay=0:0:enable='gte(t,{text_start})'[outv]",
+        "-map", "[outv]", "-map", "2:a",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+        "-c:a", "aac", "-b:a", "128k",
+        "-af", f"afade=t=in:st=0:d=0.5,afade=t=out:st={audio_fade_out_start}:d=0.5",
+        "-t", str(duration),
+        output_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {result.stderr[-2000:]}")
