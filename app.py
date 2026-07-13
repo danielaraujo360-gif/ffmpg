@@ -283,7 +283,7 @@ def _run_ffmpeg_slideshow(
         label = f"seg{i}"
         seg_filters.append(
             f"[{photo_idx}:v]scale={zoom_w}:{zoom_h}:force_original_aspect_ratio=increase,"
-            f"crop={zoom_w}:{zoom_h},trim=duration={SLIDESHOW_SEGMENT_DURATION},setpts=PTS-STARTPTS[{label}]"
+            f"crop={zoom_w}:{zoom_h},setsar=1,trim=duration={SLIDESHOW_SEGMENT_DURATION},setpts=PTS-STARTPTS[{label}]"
         )
         seg_labels.append(f"[{label}]")
     concat_filter = "".join(seg_labels) + f"concat=n={num_segments}:v=1:a=0[raw]"
