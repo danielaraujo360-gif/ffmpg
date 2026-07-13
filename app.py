@@ -194,14 +194,18 @@ def _run_ffmpeg(bg_path: str, overlay_path: str, music_path: str, output_path: s
     text_start = fade_dur + 0.1
     audio_fade_out_start = max(duration - 0.5, 0)
 
+    zoom_w, zoom_h = WIDTH * 2, HEIGHT * 2
+
     cmd = [
         "ffmpeg", "-y",
-        "-loop", "1", "-t", str(duration), "-i", bg_path,
+        "-loop", "1", "-r", "30", "-t", str(duration), "-i", bg_path,
         "-loop", "1", "-t", str(duration), "-i", overlay_path,
         "-i", music_path,
         "-filter_complex",
-        f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={WIDTH}:{HEIGHT},"
+        f"[0:v]scale={zoom_w}:{zoom_h}:force_original_aspect_ratio=increase,"
+        f"crop={zoom_w}:{zoom_h},"
+        f"zoompan=z='min(zoom+0.0006,1.15)':d=1:"
+        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={WIDTH}x{HEIGHT}:fps=30,"
         f"eq=contrast=1.18:brightness=-0.05:saturation=0.82,"
         f"colorbalance=rs=0.05:gs=0:bs=-0.1,"
         f"vignette=PI/3.5,"
