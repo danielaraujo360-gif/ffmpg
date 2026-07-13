@@ -8,7 +8,7 @@ from typing import Optional
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from pydantic import BaseModel
 
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
@@ -22,6 +22,12 @@ PHRASE_TOP_Y = 260
 WATERMARK_TEXT = "@divindadesabedoria_"
 WATERMARK_FONT_SIZE = 30
 WATERMARK_BOTTOM_MARGIN = 260
+SHADOW_OFFSET = (0, 6)
+SHADOW_BLUR_RADIUS = 5
+SHADOW_ALPHA = 150
+TOP_SCRIM_HEIGHT = 560
+BOTTOM_SCRIM_HEIGHT = 420
+SCRIM_MAX_ALPHA = 130
 
 app = FastAPI()
 
@@ -126,29 +132,57 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFon
     return lines
 
 
+def _draw_gradient_scrim(img: Image.Image, y_start: int, y_end: int, max_alpha: int, fade_toward: str) -> None:
+    draw = ImageDraw.Draw(img)
+    height = y_end - y_start
+    for i in range(height):
+        t = (1 - i / height) if fade_toward == "top" else (i / height)
+        alpha = int(max_alpha * t)
+        draw.line([(0, y_start + i), (WIDTH, y_start + i)], fill=(0, 0, 0, alpha))
+
+
 def _create_text_overlay(phrase: str) -> Image.Image:
     img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
 
+    _draw_gradient_scrim(img, 0, TOP_SCRIM_HEIGHT, SCRIM_MAX_ALPHA, fade_toward="top")
+    _draw_gradient_scrim(img, HEIGHT - BOTTOM_SCRIM_HEIGHT, HEIGHT, SCRIM_MAX_ALPHA, fade_toward="bottom")
+
+    draw = ImageDraw.Draw(img)
     max_text_width = int(WIDTH * 0.85)
     font = ImageFont.truetype(FONT_PATH, PHRASE_FONT_SIZE)
     lines = _wrap_text(draw, phrase, font, max_text_width)
-
-    y = PHRASE_TOP_Y
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        line_height = bbox[3]
-        x = (WIDTH - (bbox[2] - bbox[0])) // 2
-        draw.text((x, y), line, font=font, fill="white", stroke_width=4, stroke_fill="black")
-        y += line_height + 20
-
     watermark_font = ImageFont.truetype(FONT_PATH, WATERMARK_FONT_SIZE)
     wm_bbox = draw.textbbox((0, 0), WATERMARK_TEXT, font=watermark_font)
     wm_x = (WIDTH - (wm_bbox[2] - wm_bbox[0])) // 2
     wm_y = HEIGHT - WATERMARK_BOTTOM_MARGIN
+
+    # Soft drop shadow layer, blurred and composited behind the crisp text for a sense of depth.
+    shadow_layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow_layer)
+    y = PHRASE_TOP_Y
+    line_positions = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_height = bbox[3]
+        x = (WIDTH - (bbox[2] - bbox[0])) // 2
+        line_positions.append((x, y, line))
+        shadow_draw.text(
+            (x + SHADOW_OFFSET[0], y + SHADOW_OFFSET[1]), line, font=font, fill=(0, 0, 0, SHADOW_ALPHA)
+        )
+        y += line_height + 20
+    shadow_draw.text(
+        (wm_x + SHADOW_OFFSET[0], wm_y + SHADOW_OFFSET[1]), WATERMARK_TEXT, font=watermark_font,
+        fill=(0, 0, 0, SHADOW_ALPHA),
+    )
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(SHADOW_BLUR_RADIUS))
+    img = Image.alpha_composite(img, shadow_layer)
+
+    draw = ImageDraw.Draw(img)
+    for x, y, line in line_positions:
+        draw.text((x, y), line, font=font, fill="white", stroke_width=3, stroke_fill="black")
     draw.text(
         (wm_x, wm_y), WATERMARK_TEXT, font=watermark_font,
-        fill=(255, 255, 255, 175), stroke_width=2, stroke_fill=(0, 0, 0, 175),
+        fill=(255, 255, 255, 200), stroke_width=1, stroke_fill=(0, 0, 0, 200),
     )
 
     return img
@@ -167,9 +201,9 @@ def _run_ffmpeg(bg_path: str, overlay_path: str, music_path: str, output_path: s
         "-filter_complex",
         f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
         f"crop={WIDTH}:{HEIGHT},"
-        f"eq=contrast=1.05:saturation=1.1,"
-        f"colorbalance=rs=0.08:gs=0.02:bs=-0.08,"
-        f"vignette=PI/4,"
+        f"eq=contrast=1.18:brightness=-0.05:saturation=0.82,"
+        f"colorbalance=rs=0.05:gs=0:bs=-0.1,"
+        f"vignette=PI/3.5,"
         f"fade=t=in:st=0:d={fade_dur}[bg];"
         f"[bg][1:v]overlay=0:0:enable='gte(t,{text_start})'[outv]",
         "-map", "[outv]", "-map", "2:a",
