@@ -263,51 +263,47 @@ def _run_ffmpeg_slideshow(
     fade_dur = 1.2
     text_start = fade_dur + 0.1
     audio_fade_out_start = max(duration - 0.5, 0)
+    workdir = os.path.dirname(output_path)
+
+    # Render each unique photo into its own tiny, self-contained clip first. Reusing a single
+    # split "infinite loop" stream across dozens of independent trims in one filter graph is a
+    # known ffmpeg trouble spot (frames from later trims can come back with the wrong
+    # dimensions) -- pre-materializing finite clips and concatenating them sidesteps that.
+    segment_paths = []
+    for i, photo_path in enumerate(photo_paths):
+        seg_path = os.path.join(workdir, f"slide_seg_{i}.mp4")
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-r", "30", "-i", photo_path,
+            "-t", str(SLIDESHOW_SEGMENT_DURATION),
+            "-vf", f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},setsar=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+            seg_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"ffmpeg (slideshow segment {i}) failed: {result.stderr[-1500:]}")
+        segment_paths.append(seg_path)
 
     num_segments = max(1, round(duration / SLIDESHOW_SEGMENT_DURATION))
-    n_photos = len(photo_paths)
-    overlay_input_idx = n_photos
-    music_input_idx = n_photos + 1
-
-    input_args = []
-    for p in photo_paths:
-        input_args += ["-loop", "1", "-r", "30", "-i", p]
-    input_args += ["-loop", "1", "-t", str(duration), "-i", overlay_path]
-    input_args += ["-i", music_path]
-
-    # Scale/crop each unique photo exactly once, then reuse that prepared stream for every
-    # segment that shows it -- doing the expensive scale per-segment (dozens of times) instead
-    # of per-photo made ffmpeg grind to a halt on the 5-photo/38-segment slideshow case.
-    prescale_filters = [
-        f"[{i}:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={WIDTH}:{HEIGHT},setsar=1[p{i}]"
-        for i in range(n_photos)
-    ]
-
-    seg_filters = []
-    seg_labels = []
-    for i in range(num_segments):
-        photo_idx = i % n_photos
-        label = f"seg{i}"
-        seg_filters.append(
-            f"[p{photo_idx}]trim=duration={SLIDESHOW_SEGMENT_DURATION},setpts=PTS-STARTPTS[{label}]"
-        )
-        seg_labels.append(f"[{label}]")
-    concat_filter = "".join(seg_labels) + f"concat=n={num_segments}:v=1:a=0[raw]"
-
-    filter_complex = ";".join(prescale_filters) + ";" + ";".join(seg_filters) + ";" + concat_filter + (
-        f";[raw]eq=contrast=1.18:brightness=-0.05:saturation=0.82,"
-        f"colorbalance=rs=0.05:gs=0:bs=-0.1,"
-        f"vignette=PI/3.5,"
-        f"fade=t=in:st=0:d={fade_dur}[bg];"
-        f"[bg][{overlay_input_idx}:v]overlay=0:0:enable='gte(t,{text_start})'[outv]"
-    )
+    concat_list_path = os.path.join(workdir, "concat_list.txt")
+    with open(concat_list_path, "w") as f:
+        for i in range(num_segments):
+            seg = segment_paths[i % len(segment_paths)]
+            f.write(f"file '{seg}'\n")
 
     cmd = [
         "ffmpeg", "-y",
-        *input_args,
-        "-filter_complex", filter_complex,
-        "-map", "[outv]", "-map", f"{music_input_idx}:a",
+        "-f", "concat", "-safe", "0", "-i", concat_list_path,
+        "-loop", "1", "-t", str(duration), "-i", overlay_path,
+        "-i", music_path,
+        "-filter_complex",
+        f"[0:v]eq=contrast=1.18:brightness=-0.05:saturation=0.82,"
+        f"colorbalance=rs=0.05:gs=0:bs=-0.1,"
+        f"vignette=PI/3.5,"
+        f"fade=t=in:st=0:d={fade_dur}[bg];"
+        f"[bg][1:v]overlay=0:0:enable='gte(t,{text_start})'[outv]",
+        "-map", "[outv]", "-map", "2:a",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
         "-c:a", "aac", "-b:a", "128k",
         "-af", f"afade=t=in:st=0:d=0.5,afade=t=out:st={audio_fade_out_start}:d=0.5",
@@ -317,4 +313,4 @@ def _run_ffmpeg_slideshow(
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {result.stderr[-2000:]}")
+        raise HTTPException(status_code=500, detail=f"ffmpeg (slideshow concat) failed: {result.stderr[-2000:]}")
