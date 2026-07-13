@@ -15,8 +15,13 @@ RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "reels")
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_PATH = "/app/fonts/Poppins-Bold.ttf"
 WIDTH, HEIGHT = 1080, 1920
+PHRASE_FONT_SIZE = 64
+PHRASE_TOP_Y = 260
+WATERMARK_TEXT = "@divindadesabedoria_"
+WATERMARK_FONT_SIZE = 30
+WATERMARK_BOTTOM_MARGIN = 260
 
 app = FastAPI()
 
@@ -125,25 +130,26 @@ def _create_text_overlay(phrase: str) -> Image.Image:
     img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    font_size = 72
     max_text_width = int(WIDTH * 0.85)
-    font = ImageFont.truetype(FONT_PATH, font_size)
+    font = ImageFont.truetype(FONT_PATH, PHRASE_FONT_SIZE)
     lines = _wrap_text(draw, phrase, font, max_text_width)
 
-    while len(lines) > 4 and font_size > 40:
-        font_size -= 4
-        font = ImageFont.truetype(FONT_PATH, font_size)
-        lines = _wrap_text(draw, phrase, font, max_text_width)
-
-    line_heights = [draw.textbbox((0, 0), line, font=font)[3] for line in lines]
-    total_height = sum(line_heights) + (len(lines) - 1) * 20
-    y = int(HEIGHT * 0.55) - total_height // 2
-
-    for line, line_height in zip(lines, line_heights):
+    y = PHRASE_TOP_Y
+    for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
+        line_height = bbox[3]
         x = (WIDTH - (bbox[2] - bbox[0])) // 2
         draw.text((x, y), line, font=font, fill="white", stroke_width=4, stroke_fill="black")
         y += line_height + 20
+
+    watermark_font = ImageFont.truetype(FONT_PATH, WATERMARK_FONT_SIZE)
+    wm_bbox = draw.textbbox((0, 0), WATERMARK_TEXT, font=watermark_font)
+    wm_x = (WIDTH - (wm_bbox[2] - wm_bbox[0])) // 2
+    wm_y = HEIGHT - WATERMARK_BOTTOM_MARGIN
+    draw.text(
+        (wm_x, wm_y), WATERMARK_TEXT, font=watermark_font,
+        fill=(255, 255, 255, 175), stroke_width=2, stroke_fill=(0, 0, 0, 175),
+    )
 
     return img
 
@@ -160,7 +166,11 @@ def _run_ffmpeg(bg_path: str, overlay_path: str, music_path: str, output_path: s
         "-i", music_path,
         "-filter_complex",
         f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={WIDTH}:{HEIGHT},fade=t=in:st=0:d={fade_dur}[bg];"
+        f"crop={WIDTH}:{HEIGHT},"
+        f"eq=contrast=1.05:saturation=1.1,"
+        f"colorbalance=rs=0.08:gs=0.02:bs=-0.08,"
+        f"vignette=PI/4,"
+        f"fade=t=in:st=0:d={fade_dur}[bg];"
         f"[bg][1:v]overlay=0:0:enable='gte(t,{text_start})'[outv]",
         "-map", "[outv]", "-map", "2:a",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
