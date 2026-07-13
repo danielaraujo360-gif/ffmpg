@@ -263,7 +263,6 @@ def _run_ffmpeg_slideshow(
     fade_dur = 1.2
     text_start = fade_dur + 0.1
     audio_fade_out_start = max(duration - 0.5, 0)
-    zoom_w, zoom_h = WIDTH * 2, HEIGHT * 2
 
     num_segments = max(1, round(duration / SLIDESHOW_SEGMENT_DURATION))
     n_photos = len(photo_paths)
@@ -276,19 +275,27 @@ def _run_ffmpeg_slideshow(
     input_args += ["-loop", "1", "-t", str(duration), "-i", overlay_path]
     input_args += ["-i", music_path]
 
+    # Scale/crop each unique photo exactly once, then reuse that prepared stream for every
+    # segment that shows it -- doing the expensive scale per-segment (dozens of times) instead
+    # of per-photo made ffmpeg grind to a halt on the 5-photo/38-segment slideshow case.
+    prescale_filters = [
+        f"[{i}:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={WIDTH}:{HEIGHT},setsar=1[p{i}]"
+        for i in range(n_photos)
+    ]
+
     seg_filters = []
     seg_labels = []
     for i in range(num_segments):
         photo_idx = i % n_photos
         label = f"seg{i}"
         seg_filters.append(
-            f"[{photo_idx}:v]scale={zoom_w}:{zoom_h}:force_original_aspect_ratio=increase,"
-            f"crop={zoom_w}:{zoom_h},setsar=1,trim=duration={SLIDESHOW_SEGMENT_DURATION},setpts=PTS-STARTPTS[{label}]"
+            f"[p{photo_idx}]trim=duration={SLIDESHOW_SEGMENT_DURATION},setpts=PTS-STARTPTS[{label}]"
         )
         seg_labels.append(f"[{label}]")
     concat_filter = "".join(seg_labels) + f"concat=n={num_segments}:v=1:a=0[raw]"
 
-    filter_complex = ";".join(seg_filters) + ";" + concat_filter + (
+    filter_complex = ";".join(prescale_filters) + ";" + ";".join(seg_filters) + ";" + concat_filter + (
         f";[raw]eq=contrast=1.18:brightness=-0.05:saturation=0.82,"
         f"colorbalance=rs=0.05:gs=0:bs=-0.1,"
         f"vignette=PI/3.5,"
