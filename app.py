@@ -16,9 +16,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "reels")
 FONT_PATH = "/app/fonts/Poppins-Bold.ttf"
+FONT_ITALIC_PATH = "/app/fonts/Poppins-Italic.ttf"
+FONT_BOLD_ITALIC_PATH = "/app/fonts/Poppins-BoldItalic.ttf"
 WIDTH, HEIGHT = 1080, 1920
-PHRASE_FONT_SIZE = 64
-PHRASE_TOP_Y = 260
+PHRASE_FONT_SIZE = 54
 WATERMARK_TEXT = "@divindadesabedoria_"
 WATERMARK_FONT_SIZE = 30
 WATERMARK_BOTTOM_MARGIN = 260
@@ -26,7 +27,6 @@ LINE_SPACING = 8
 SHADOW_OFFSET = (0, 6)
 SHADOW_BLUR_RADIUS = 5
 SHADOW_ALPHA = 150
-TOP_SCRIM_HEIGHT = 560
 BOTTOM_SCRIM_HEIGHT = 420
 CENTER_SCRIM_HEIGHT = 550
 SCRIM_MAX_ALPHA = 130
@@ -41,6 +41,7 @@ class RenderRequest(BaseModel):
     image_urls: Optional[List[str]] = None
     image_b64: Optional[str] = None
     phrase: str
+    highlight_word: Optional[str] = None
     music_url: str
     duration: float = 7.5
 
@@ -67,8 +68,7 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
         output_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp4")
         _download(req.music_url, music_path)
 
-        text_position = "center" if req.style == "slideshow" else "top"
-        overlay_img = _create_text_overlay(req.phrase, text_position=text_position)
+        overlay_img = _create_text_overlay(req.phrase, req.highlight_word)
         overlay_img.save(overlay_path)
 
         if req.style == "slideshow":
@@ -130,18 +130,36 @@ def _download(url: str, dest: str) -> None:
             f.write(chunk)
 
 
-def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-    words = text.split()
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        test = f"{current} {word}".strip()
-        bbox = draw.textbbox((0, 0), test, font=font)
-        if bbox[2] - bbox[0] <= max_width or not current:
-            current = test
-        else:
+def _find_highlight_index(words: list[str], highlight_word: Optional[str]) -> Optional[int]:
+    if not highlight_word:
+        return None
+    target = highlight_word.strip(".,!?;:\"'()").lower()
+    for i, word in enumerate(words):
+        if word.strip(".,!?;:\"'()").lower() == target:
+            return i
+    return None
+
+
+def _wrap_words_mixed(
+    draw: ImageDraw.ImageDraw, words: list[str], highlight_idx: Optional[int],
+    font_regular: ImageFont.FreeTypeFont, font_bold: ImageFont.FreeTypeFont, max_width: int
+) -> list[list[tuple]]:
+    space_width = draw.textlength(" ", font=font_regular)
+    lines: list[list[tuple]] = []
+    current: list[tuple] = []
+    current_width = 0.0
+    for i, word in enumerate(words):
+        font = font_bold if i == highlight_idx else font_regular
+        bbox = draw.textbbox((0, 0), word, font=font)
+        word_width = bbox[2] - bbox[0]
+        extra = (space_width if current else 0) + word_width
+        if current and current_width + extra > max_width:
             lines.append(current)
-            current = word
+            current = []
+            current_width = 0.0
+            extra = word_width
+        current.append((word, font, word_width))
+        current_width += extra
     if current:
         lines.append(current)
     return lines
@@ -166,42 +184,44 @@ def _draw_center_scrim(img: Image.Image, y_start: int, y_end: int, max_alpha: in
         draw.line([(0, y_start + i), (WIDTH, y_start + i)], fill=(0, 0, 0, alpha))
 
 
-def _create_text_overlay(phrase: str, text_position: str = "top") -> Image.Image:
+def _create_text_overlay(phrase: str, highlight_word: Optional[str] = None) -> Image.Image:
     img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-
-    if text_position == "center":
-        _draw_center_scrim(img, HEIGHT // 2 - CENTER_SCRIM_HEIGHT // 2, HEIGHT // 2 + CENTER_SCRIM_HEIGHT // 2, SCRIM_MAX_ALPHA)
-    else:
-        _draw_gradient_scrim(img, 0, TOP_SCRIM_HEIGHT, SCRIM_MAX_ALPHA, fade_toward="top")
+    _draw_center_scrim(img, HEIGHT // 2 - CENTER_SCRIM_HEIGHT // 2, HEIGHT // 2 + CENTER_SCRIM_HEIGHT // 2, SCRIM_MAX_ALPHA)
     _draw_gradient_scrim(img, HEIGHT - BOTTOM_SCRIM_HEIGHT, HEIGHT, SCRIM_MAX_ALPHA, fade_toward="bottom")
 
     draw = ImageDraw.Draw(img)
     max_text_width = int(WIDTH * 0.85)
-    font = ImageFont.truetype(FONT_PATH, PHRASE_FONT_SIZE)
-    lines = _wrap_text(draw, phrase, font, max_text_width)
+    font_italic = ImageFont.truetype(FONT_ITALIC_PATH, PHRASE_FONT_SIZE)
+    font_bold_italic = ImageFont.truetype(FONT_BOLD_ITALIC_PATH, PHRASE_FONT_SIZE)
     watermark_font = ImageFont.truetype(FONT_PATH, WATERMARK_FONT_SIZE)
+
+    words = phrase.split()
+    highlight_idx = _find_highlight_index(words, highlight_word)
+    lines = _wrap_words_mixed(draw, words, highlight_idx, font_italic, font_bold_italic, max_text_width)
+    space_width = draw.textlength(" ", font=font_italic)
+
+    ref_bbox = draw.textbbox((0, 0), "Ág", font=font_italic)
+    line_height = ref_bbox[3] - ref_bbox[1]
+    total_height = len(lines) * line_height + (len(lines) - 1) * LINE_SPACING
+    y = HEIGHT // 2 - total_height // 2
+
     wm_bbox = draw.textbbox((0, 0), WATERMARK_TEXT, font=watermark_font)
     wm_x = (WIDTH - (wm_bbox[2] - wm_bbox[0])) // 2
     wm_y = HEIGHT - WATERMARK_BOTTOM_MARGIN
 
-    line_heights = [draw.textbbox((0, 0), line, font=font)[3] for line in lines]
-    if text_position == "center":
-        total_height = sum(line_heights) + (len(lines) - 1) * LINE_SPACING
-        y = HEIGHT // 2 - total_height // 2
-    else:
-        y = PHRASE_TOP_Y
-
     # Soft drop shadow layer, blurred and composited behind the crisp text for a sense of depth.
     shadow_layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow_layer)
-    line_positions = []
-    for line, line_height in zip(lines, line_heights):
-        bbox = draw.textbbox((0, 0), line, font=font)
-        x = (WIDTH - (bbox[2] - bbox[0])) // 2
-        line_positions.append((x, y, line))
-        shadow_draw.text(
-            (x + SHADOW_OFFSET[0], y + SHADOW_OFFSET[1]), line, font=font, fill=(0, 0, 0, SHADOW_ALPHA)
-        )
+    word_positions = []
+    for line in lines:
+        line_width = sum(w[2] for w in line) + space_width * (len(line) - 1)
+        x = (WIDTH - line_width) // 2
+        for word, font, word_width in line:
+            word_positions.append((x, y, word, font))
+            shadow_draw.text(
+                (x + SHADOW_OFFSET[0], y + SHADOW_OFFSET[1]), word, font=font, fill=(0, 0, 0, SHADOW_ALPHA)
+            )
+            x += word_width + space_width
         y += line_height + LINE_SPACING
     shadow_draw.text(
         (wm_x + SHADOW_OFFSET[0], wm_y + SHADOW_OFFSET[1]), WATERMARK_TEXT, font=watermark_font,
@@ -211,8 +231,8 @@ def _create_text_overlay(phrase: str, text_position: str = "top") -> Image.Image
     img = Image.alpha_composite(img, shadow_layer)
 
     draw = ImageDraw.Draw(img)
-    for x, y, line in line_positions:
-        draw.text((x, y), line, font=font, fill="white", stroke_width=3, stroke_fill="black")
+    for x, y, word, font in word_positions:
+        draw.text((x, y), word, font=font, fill="white", stroke_width=3, stroke_fill="black")
     draw.text(
         (wm_x, wm_y), WATERMARK_TEXT, font=watermark_font,
         fill=(255, 255, 255, 200), stroke_width=1, stroke_fill=(0, 0, 0, 200),
