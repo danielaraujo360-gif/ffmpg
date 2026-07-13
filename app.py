@@ -22,6 +22,7 @@ PHRASE_TOP_Y = 260
 WATERMARK_TEXT = "@divindadesabedoria_"
 WATERMARK_FONT_SIZE = 30
 WATERMARK_BOTTOM_MARGIN = 260
+LINE_SPACING = 8
 SHADOW_OFFSET = (0, 6)
 SHADOW_BLUR_RADIUS = 5
 SHADOW_ALPHA = 150
@@ -169,7 +170,7 @@ def _create_text_overlay(phrase: str) -> Image.Image:
         shadow_draw.text(
             (x + SHADOW_OFFSET[0], y + SHADOW_OFFSET[1]), line, font=font, fill=(0, 0, 0, SHADOW_ALPHA)
         )
-        y += line_height + 20
+        y += line_height + LINE_SPACING
     shadow_draw.text(
         (wm_x + SHADOW_OFFSET[0], wm_y + SHADOW_OFFSET[1]), WATERMARK_TEXT, font=watermark_font,
         fill=(0, 0, 0, SHADOW_ALPHA),
