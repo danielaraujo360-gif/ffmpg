@@ -204,7 +204,7 @@ def _run_ffmpeg(bg_path: str, overlay_path: str, music_path: str, output_path: s
         "-filter_complex",
         f"[0:v]scale={zoom_w}:{zoom_h}:force_original_aspect_ratio=increase,"
         f"crop={zoom_w}:{zoom_h},"
-        f"zoompan=z='min(zoom+0.0006,1.15)':d=1:"
+        f"zoompan=z='min(zoom+0.0022,1.45)':d=1:"
         f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={WIDTH}x{HEIGHT}:fps=30,"
         f"eq=contrast=1.18:brightness=-0.05:saturation=0.82,"
         f"colorbalance=rs=0.05:gs=0:bs=-0.1,"
