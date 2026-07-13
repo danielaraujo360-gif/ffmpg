@@ -8,12 +8,13 @@ from typing import Optional
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
-from starlette.background import BackgroundTask
 
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "reels")
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 WIDTH, HEIGHT = 1080, 1920
 
@@ -60,18 +61,33 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
 
         _run_ffmpeg(bg_path, overlay_path, music_path, output_path, req.duration)
 
-        return FileResponse(
-            output_path,
-            media_type="video/mp4",
-            filename="reel.mp4",
-            background=BackgroundTask(shutil.rmtree, workdir, ignore_errors=True),
-        )
+        video_url = _upload_to_supabase(output_path)
+        shutil.rmtree(workdir, ignore_errors=True)
+        return {"video_url": video_url}
     except HTTPException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
     except Exception as e:
         shutil.rmtree(workdir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _upload_to_supabase(file_path: str) -> str:
+    filename = f"{uuid.uuid4().hex}.mp4"
+    with open(file_path, "rb") as f:
+        r = requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{filename}",
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Content-Type": "video/mp4",
+            },
+            data=f,
+            timeout=60,
+        )
+    if r.status_code >= 300:
+        raise HTTPException(status_code=502, detail=f"supabase upload failed: {r.text}")
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{filename}"
 
 
 def _guess_ext(url: str) -> str:
