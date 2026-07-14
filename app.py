@@ -15,19 +15,14 @@ RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "reels")
-FONT_PATH = "/app/fonts/Poppins-Bold.ttf"
 FONT_ITALIC_PATH = "/app/fonts/Poppins-Italic.ttf"
 FONT_BOLD_ITALIC_PATH = "/app/fonts/Poppins-BoldItalic.ttf"
 WIDTH, HEIGHT = 1080, 1920
 PHRASE_FONT_SIZE = 54
-WATERMARK_TEXT = "@divindadesabedoria_"
-WATERMARK_FONT_SIZE = 30
-WATERMARK_BOTTOM_MARGIN = 260
 LINE_SPACING = 8
 SHADOW_OFFSET = (0, 6)
 SHADOW_BLUR_RADIUS = 5
 SHADOW_ALPHA = 150
-BOTTOM_SCRIM_HEIGHT = 420
 CENTER_SCRIM_HEIGHT = 550
 SCRIM_MAX_ALPHA = 130
 SLIDESHOW_SEGMENT_DURATION = 0.2
@@ -220,15 +215,6 @@ def _wrap_words_mixed(
     return lines
 
 
-def _draw_gradient_scrim(img: Image.Image, y_start: int, y_end: int, max_alpha: int, fade_toward: str) -> None:
-    draw = ImageDraw.Draw(img)
-    height = y_end - y_start
-    for i in range(height):
-        t = (1 - i / height) if fade_toward == "top" else (i / height)
-        alpha = int(max_alpha * t)
-        draw.line([(0, y_start + i), (WIDTH, y_start + i)], fill=(0, 0, 0, alpha))
-
-
 def _draw_center_scrim(img: Image.Image, y_start: int, y_end: int, max_alpha: int) -> None:
     draw = ImageDraw.Draw(img)
     height = y_end - y_start
@@ -242,13 +228,11 @@ def _draw_center_scrim(img: Image.Image, y_start: int, y_end: int, max_alpha: in
 def _create_text_overlay(phrase: str, highlight_word: Optional[str] = None) -> Image.Image:
     img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     _draw_center_scrim(img, HEIGHT // 2 - CENTER_SCRIM_HEIGHT // 2, HEIGHT // 2 + CENTER_SCRIM_HEIGHT // 2, SCRIM_MAX_ALPHA)
-    _draw_gradient_scrim(img, HEIGHT - BOTTOM_SCRIM_HEIGHT, HEIGHT, SCRIM_MAX_ALPHA, fade_toward="bottom")
 
     draw = ImageDraw.Draw(img)
     max_text_width = int(WIDTH * 0.85)
     font_italic = ImageFont.truetype(FONT_ITALIC_PATH, PHRASE_FONT_SIZE)
     font_bold_italic = ImageFont.truetype(FONT_BOLD_ITALIC_PATH, PHRASE_FONT_SIZE)
-    watermark_font = ImageFont.truetype(FONT_PATH, WATERMARK_FONT_SIZE)
 
     words = phrase.split()
     highlight_idx = _find_highlight_index(words, highlight_word)
@@ -259,10 +243,6 @@ def _create_text_overlay(phrase: str, highlight_word: Optional[str] = None) -> I
     line_height = ref_bbox[3] - ref_bbox[1]
     total_height = len(lines) * line_height + (len(lines) - 1) * LINE_SPACING
     y = HEIGHT // 2 - total_height // 2
-
-    wm_bbox = draw.textbbox((0, 0), WATERMARK_TEXT, font=watermark_font)
-    wm_x = (WIDTH - (wm_bbox[2] - wm_bbox[0])) // 2
-    wm_y = HEIGHT - WATERMARK_BOTTOM_MARGIN
 
     # Soft drop shadow layer, blurred and composited behind the crisp text for a sense of depth.
     shadow_layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
@@ -278,20 +258,12 @@ def _create_text_overlay(phrase: str, highlight_word: Optional[str] = None) -> I
             )
             x += word_width + space_width
         y += line_height + LINE_SPACING
-    shadow_draw.text(
-        (wm_x + SHADOW_OFFSET[0], wm_y + SHADOW_OFFSET[1]), WATERMARK_TEXT, font=watermark_font,
-        fill=(0, 0, 0, SHADOW_ALPHA),
-    )
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(SHADOW_BLUR_RADIUS))
     img = Image.alpha_composite(img, shadow_layer)
 
     draw = ImageDraw.Draw(img)
     for x, y, word, font in word_positions:
         draw.text((x, y), word, font=font, fill="white", stroke_width=3, stroke_fill="black")
-    draw.text(
-        (wm_x, wm_y), WATERMARK_TEXT, font=watermark_font,
-        fill=(255, 255, 255, 200), stroke_width=1, stroke_fill=(0, 0, 0, 200),
-    )
 
     return img
 
