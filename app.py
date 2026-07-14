@@ -31,6 +31,8 @@ BOTTOM_SCRIM_HEIGHT = 420
 CENTER_SCRIM_HEIGHT = 550
 SCRIM_MAX_ALPHA = 130
 SLIDESHOW_SEGMENT_DURATION = 0.2
+MIN_DURATION = 4.0
+MAX_DURATION = 60.0
 
 app = FastAPI()
 
@@ -43,7 +45,6 @@ class RenderRequest(BaseModel):
     phrase: str
     highlight_word: Optional[str] = None
     music_url: str
-    duration: float = 7.5
 
 
 @app.get("/health")
@@ -68,6 +69,9 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
         output_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp4")
         _download(req.music_url, music_path)
 
+        duration = _probe_duration(music_path)
+        duration = max(MIN_DURATION, min(duration, MAX_DURATION))
+
         overlay_img = _create_text_overlay(req.phrase, req.highlight_word)
         overlay_img.save(overlay_path)
 
@@ -77,7 +81,7 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
                 p = os.path.join(workdir, f"photo_{i}.jpg")
                 _download(url, p)
                 photo_paths.append(p)
-            _run_ffmpeg_slideshow(photo_paths, overlay_path, music_path, output_path, req.duration)
+            _run_ffmpeg_slideshow(photo_paths, overlay_path, music_path, output_path, duration)
         else:
             bg_path = os.path.join(workdir, "bg.jpg")
             if req.image_b64:
@@ -85,7 +89,7 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
                     f.write(base64.b64decode(req.image_b64))
             else:
                 _download(req.image_url, bg_path)
-            _run_ffmpeg(bg_path, overlay_path, music_path, output_path, req.duration)
+            _run_ffmpeg(bg_path, overlay_path, music_path, output_path, duration)
 
         video_url = _upload_to_supabase(output_path)
         shutil.rmtree(workdir, ignore_errors=True)
@@ -166,6 +170,19 @@ def _download(url: str, dest: str) -> None:
     with open(dest, "wb") as f:
         for chunk in r.iter_content(8192):
             f.write(chunk)
+
+
+def _probe_duration(path: str) -> float:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        raise HTTPException(status_code=500, detail=f"ffprobe failed: {result.stderr[-500:]}")
+    return float(result.stdout.strip())
 
 
 def _find_highlight_index(words: list[str], highlight_word: Optional[str]) -> Optional[int]:
