@@ -98,15 +98,53 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _upload_to_supabase(file_path: str) -> str:
-    filename = f"{uuid.uuid4().hex}.mp4"
+class ExtractAudioRequest(BaseModel):
+    video_url: str
+
+
+@app.post("/extract-audio")
+def extract_audio(req: ExtractAudioRequest, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    workdir = tempfile.mkdtemp(prefix="extract_")
+    try:
+        video_path = os.path.join(workdir, "input" + _guess_ext(req.video_url))
+        audio_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp3")
+        _download(req.video_url, video_path)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-vn", "-acodec", "libmp3lame", "-q:a", "2",
+            audio_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"ffmpeg (extract-audio) failed: {result.stderr[-2000:]}")
+
+        audio_url = _upload_to_supabase(audio_path, folder="musicas/", ext=".mp3", content_type="audio/mpeg")
+        shutil.rmtree(workdir, ignore_errors=True)
+        return {"audio_url": audio_url}
+    except HTTPException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _upload_to_supabase(
+    file_path: str, folder: str = "", ext: str = ".mp4", content_type: str = "video/mp4"
+) -> str:
+    filename = f"{folder}{uuid.uuid4().hex}{ext}"
     with open(file_path, "rb") as f:
         r = requests.post(
             f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{filename}",
             headers={
                 "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                 "apikey": SUPABASE_SERVICE_KEY,
-                "Content-Type": "video/mp4",
+                "Content-Type": content_type,
             },
             data=f,
             timeout=60,
