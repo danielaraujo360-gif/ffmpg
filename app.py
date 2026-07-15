@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from typing import List, Optional
 
@@ -176,7 +177,7 @@ def clips_prepare(req: PrepareClipsRequest, x_api_key: str = Header(default=""))
         outtmpl = os.path.join(workdir, "source.%(ext)s")
         ydl_opts = {
             "outtmpl": outtmpl,
-            "format": "bestvideo+bestaudio/best",
+            "format": "best",
             "merge_output_format": "mp4",
             "quiet": True,
             "no_warnings": True,
@@ -184,8 +185,23 @@ def clips_prepare(req: PrepareClipsRequest, x_api_key: str = Header(default=""))
         cookies_path = _get_youtube_cookies_path()
         if cookies_path:
             ydl_opts["cookiefile"] = cookies_path
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([req.video_url])
+
+        # YouTube's anti-bot format-serving is flaky right now (SABR streaming rollout) --
+        # roughly 1 in 3 attempts succeeds with no change in request. Retry a few times
+        # before giving up rather than failing on the first unlucky attempt.
+        last_error: Optional[Exception] = None
+        for attempt in range(5):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([req.video_url])
+                last_error = None
+                break
+            except yt_dlp.utils.DownloadError as e:
+                last_error = e
+                time.sleep(3)
+                continue
+        if last_error is not None:
+            raise HTTPException(status_code=502, detail=f"yt-dlp failed after retries: {last_error}")
 
         candidates = [f for f in os.listdir(workdir) if f.startswith("source.")]
         if not candidates:
