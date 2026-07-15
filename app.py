@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from typing import List, Optional
@@ -167,11 +168,10 @@ class PrepareClipsRequest(BaseModel):
     video_url: str
 
 
-@app.post("/clips/prepare")
-def clips_prepare(req: PrepareClipsRequest, x_api_key: str = Header(default="")):
-    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
-        raise HTTPException(status_code=401, detail="unauthorized")
+CLIPS_JOBS: dict = {}
 
+
+def _run_prepare_job(job_id: str, video_url: str) -> None:
     workdir = tempfile.mkdtemp(prefix="clips_prepare_")
     try:
         outtmpl = os.path.join(workdir, "source.%(ext)s")
@@ -187,13 +187,13 @@ def clips_prepare(req: PrepareClipsRequest, x_api_key: str = Header(default=""))
             ydl_opts["cookiefile"] = cookies_path
 
         # YouTube's anti-bot format-serving is flaky right now (SABR streaming rollout) --
-        # roughly 1 in 3 attempts succeeds with no change in request. Retry a few times
-        # before giving up rather than failing on the first unlucky attempt.
+        # success rate varies attempt to attempt with no change in request. Retry a few
+        # times before giving up rather than failing on the first unlucky attempt.
         last_error: Optional[Exception] = None
         for attempt in range(5):
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([req.video_url])
+                    ydl.download([video_url])
                 last_error = None
                 break
             except yt_dlp.utils.DownloadError as e:
@@ -201,11 +201,11 @@ def clips_prepare(req: PrepareClipsRequest, x_api_key: str = Header(default=""))
                 time.sleep(3)
                 continue
         if last_error is not None:
-            raise HTTPException(status_code=502, detail=f"yt-dlp failed after retries: {last_error}")
+            raise RuntimeError(f"yt-dlp failed after retries: {last_error}")
 
         candidates = [f for f in os.listdir(workdir) if f.startswith("source.")]
         if not candidates:
-            raise HTTPException(status_code=500, detail="yt-dlp did not produce an output file")
+            raise RuntimeError("yt-dlp did not produce an output file")
         source_path = os.path.join(workdir, candidates[0])
 
         duration = _probe_duration(source_path)
@@ -221,14 +221,35 @@ def clips_prepare(req: PrepareClipsRequest, x_api_key: str = Header(default=""))
                 words.append({"word": w.word.strip(), "start": w.start, "end": w.end})
 
         source_url = _upload_to_supabase(source_path, folder="cortes-source/", ext=".mp4", content_type="video/mp4")
-        shutil.rmtree(workdir, ignore_errors=True)
-        return {"source_url": source_url, "duration": duration, "segments": segments, "words": words}
-    except HTTPException:
-        shutil.rmtree(workdir, ignore_errors=True)
-        raise
+        CLIPS_JOBS[job_id] = {
+            "status": "done",
+            "result": {"source_url": source_url, "duration": duration, "segments": segments, "words": words},
+        }
     except Exception as e:
+        CLIPS_JOBS[job_id] = {"status": "error", "error": str(e)}
+    finally:
         shutil.rmtree(workdir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/clips/prepare")
+def clips_prepare(req: PrepareClipsRequest, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    job_id = uuid.uuid4().hex
+    CLIPS_JOBS[job_id] = {"status": "processing"}
+    threading.Thread(target=_run_prepare_job, args=(job_id, req.video_url), daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/clips/status/{job_id}")
+def clips_status(job_id: str, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    job = CLIPS_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
 
 
 class RenderClipRequest(BaseModel):
