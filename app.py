@@ -17,6 +17,20 @@ RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "reels")
+YOUTUBE_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64", "")
+_youtube_cookies_path: Optional[str] = None
+
+
+def _get_youtube_cookies_path() -> Optional[str]:
+    global _youtube_cookies_path
+    if not YOUTUBE_COOKIES_B64:
+        return None
+    if _youtube_cookies_path is None:
+        path = "/tmp/youtube_cookies.txt"
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(YOUTUBE_COOKIES_B64))
+        _youtube_cookies_path = path
+    return _youtube_cookies_path
 FONT_ITALIC_PATH = "/app/fonts/Poppins-Italic.ttf"
 FONT_BOLD_ITALIC_PATH = "/app/fonts/Poppins-BoldItalic.ttf"
 WIDTH, HEIGHT = 1080, 1920
@@ -166,10 +180,10 @@ def clips_prepare(req: PrepareClipsRequest, x_api_key: str = Header(default=""))
             "merge_output_format": "mp4",
             "quiet": True,
             "no_warnings": True,
-            # The "web" client is the one YouTube subjects to the "Sign in to confirm
-            # you're not a bot" check on datacenter IPs; "android" sidesteps it.
-            "extractor_args": {"youtube": {"player_client": ["android"]}},
         }
+        cookies_path = _get_youtube_cookies_path()
+        if cookies_path:
+            ydl_opts["cookiefile"] = cookies_path
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([req.video_url])
 
