@@ -166,6 +166,9 @@ def clips_prepare(req: PrepareClipsRequest, x_api_key: str = Header(default=""))
             "merge_output_format": "mp4",
             "quiet": True,
             "no_warnings": True,
+            # The "web" client is the one YouTube subjects to the "Sign in to confirm
+            # you're not a bot" check on datacenter IPs; "android" sidesteps it.
+            "extractor_args": {"youtube": {"player_client": ["android"]}},
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([req.video_url])
