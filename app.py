@@ -73,7 +73,7 @@ class RenderRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "youtube_cookies_configured": bool(YOUTUBE_COOKIES_B64), "youtube_cookies_len": len(YOUTUBE_COOKIES_B64)}
 
 
 @app.post("/render")
