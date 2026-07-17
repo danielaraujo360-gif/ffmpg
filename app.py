@@ -28,6 +28,7 @@ SCRIM_MAX_ALPHA = 130
 SLIDESHOW_SEGMENT_DURATION = 0.2
 MIN_DURATION = 4.0
 MAX_DURATION = 60.0
+THUMB_OFFSET_SECONDS = 3.0  # matches IG's thumb_offset / TikTok's video_cover_timestamp_ms
 
 app = FastAPI()
 
@@ -87,8 +88,14 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
             _run_ffmpeg(bg_path, overlay_path, music_path, output_path, duration)
 
         video_url = _upload_to_supabase(output_path)
+        thumb_path = os.path.join(workdir, "thumb.jpg")
+        thumbnail_url = None
+        if _extract_thumbnail(output_path, duration, thumb_path):
+            thumbnail_url = _upload_to_supabase(
+                thumb_path, folder="thumbs/", ext=".jpg", content_type="image/jpeg"
+            )
         shutil.rmtree(workdir, ignore_errors=True)
-        return {"video_url": video_url}
+        return {"video_url": video_url, "thumbnail_url": thumbnail_url}
     except HTTPException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
@@ -178,6 +185,15 @@ def _probe_duration(path: str) -> float:
     if result.returncode != 0 or not result.stdout.strip():
         raise HTTPException(status_code=500, detail=f"ffprobe failed: {result.stderr[-500:]}")
     return float(result.stdout.strip())
+
+
+def _extract_thumbnail(video_path: str, duration: float, out_path: str) -> bool:
+    # Grabs a frame past the fade-in-from-black intro so platforms that default
+    # to frame 0 (Facebook Reels) don't show a solid black cover.
+    offset = min(THUMB_OFFSET_SECONDS, max(0.0, duration - 0.1))
+    cmd = ["ffmpeg", "-y", "-ss", str(offset), "-i", video_path, "-frames:v", "1", out_path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0 and os.path.exists(out_path)
 
 
 def _find_highlight_index(words: list[str], highlight_word: Optional[str]) -> Optional[int]:
