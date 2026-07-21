@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 import uuid
 from typing import List, Optional
 
@@ -196,12 +197,19 @@ def _extract_thumbnail(video_path: str, duration: float, out_path: str) -> bool:
     return result.returncode == 0 and os.path.exists(out_path)
 
 
+def _fold_accents(s: str) -> str:
+    # The LLM occasionally generates the phrase and the highlighted word with slightly
+    # different accenting (e.g. "Idolos" vs "ídolos") -- strip diacritics before comparing
+    # so the highlight still matches instead of silently finding no word to bold.
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+
+
 def _find_highlight_index(words: list[str], highlight_word: Optional[str]) -> Optional[int]:
     if not highlight_word:
         return None
-    target = highlight_word.strip(".,!?;:\"'()").lower()
+    target = _fold_accents(highlight_word.strip(".,!?;:\"'()").lower())
     for i, word in enumerate(words):
-        if word.strip(".,!?;:\"'()").lower() == target:
+        if _fold_accents(word.strip(".,!?;:\"'()").lower()) == target:
             return i
     return None
 
