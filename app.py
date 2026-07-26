@@ -21,6 +21,8 @@ FONT_BOLD_ITALIC_PATH = "/app/fonts/Poppins-BoldItalic.ttf"
 WIDTH, HEIGHT = 1080, 1920
 PHRASE_FONT_SIZE = 54
 LINE_SPACING = 8
+REF_FONT_SIZE = 32
+REF_GAP = 34
 SHADOW_OFFSET = (0, 6)
 SHADOW_BLUR_RADIUS = 5
 SHADOW_ALPHA = 150
@@ -41,6 +43,7 @@ class RenderRequest(BaseModel):
     image_b64: Optional[str] = None
     phrase: str
     highlight_word: Optional[str] = None
+    verse_reference: Optional[str] = None
     music_url: str
 
 
@@ -69,7 +72,7 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
         duration = _probe_duration(music_path)
         duration = max(MIN_DURATION, min(duration, MAX_DURATION))
 
-        overlay_img = _create_text_overlay(req.phrase, req.highlight_word)
+        overlay_img = _create_text_overlay(req.phrase, req.highlight_word, req.verse_reference)
         overlay_img.save(overlay_path)
 
         if req.style == "slideshow":
@@ -249,23 +252,36 @@ def _draw_center_scrim(img: Image.Image, y_start: int, y_end: int, max_alpha: in
         draw.line([(0, y_start + i), (WIDTH, y_start + i)], fill=(0, 0, 0, alpha))
 
 
-def _create_text_overlay(phrase: str, highlight_word: Optional[str] = None) -> Image.Image:
-    img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-    _draw_center_scrim(img, HEIGHT // 2 - CENTER_SCRIM_HEIGHT // 2, HEIGHT // 2 + CENTER_SCRIM_HEIGHT // 2, SCRIM_MAX_ALPHA)
-
-    draw = ImageDraw.Draw(img)
+def _create_text_overlay(
+    phrase: str, highlight_word: Optional[str] = None, verse_reference: Optional[str] = None
+) -> Image.Image:
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     max_text_width = int(WIDTH * 0.85)
     font_italic = ImageFont.truetype(FONT_ITALIC_PATH, PHRASE_FONT_SIZE)
     font_bold_italic = ImageFont.truetype(FONT_BOLD_ITALIC_PATH, PHRASE_FONT_SIZE)
+    font_ref = ImageFont.truetype(FONT_ITALIC_PATH, REF_FONT_SIZE)
 
     words = phrase.split()
     highlight_idx = _find_highlight_index(words, highlight_word)
-    lines = _wrap_words_mixed(draw, words, highlight_idx, font_italic, font_bold_italic, max_text_width)
-    space_width = draw.textlength(" ", font=font_italic)
+    lines = _wrap_words_mixed(probe, words, highlight_idx, font_italic, font_bold_italic, max_text_width)
+    space_width = probe.textlength(" ", font=font_italic)
 
-    ref_bbox = draw.textbbox((0, 0), "Ág", font=font_italic)
+    ref_bbox = probe.textbbox((0, 0), "Ág", font=font_italic)
     line_height = ref_bbox[3] - ref_bbox[1]
-    total_height = len(lines) * line_height + (len(lines) - 1) * LINE_SPACING
+    phrase_height = len(lines) * line_height + (len(lines) - 1) * LINE_SPACING
+
+    ref_text = f"({verse_reference})" if verse_reference else None
+    ref_line_height = 0
+    if ref_text:
+        rb = probe.textbbox((0, 0), ref_text, font=font_ref)
+        ref_line_height = rb[3] - rb[1]
+
+    total_height = phrase_height + (REF_GAP + ref_line_height if ref_text else 0)
+    scrim_height = max(CENTER_SCRIM_HEIGHT, total_height + 160)
+
+    img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    _draw_center_scrim(img, HEIGHT // 2 - scrim_height // 2, HEIGHT // 2 + scrim_height // 2, SCRIM_MAX_ALPHA)
+
     y = HEIGHT // 2 - total_height // 2
 
     # Soft drop shadow layer, blurred and composited behind the crisp text for a sense of depth.
@@ -282,12 +298,25 @@ def _create_text_overlay(phrase: str, highlight_word: Optional[str] = None) -> I
             )
             x += word_width + space_width
         y += line_height + LINE_SPACING
+
+    ref_position = None
+    if ref_text:
+        y += REF_GAP - LINE_SPACING
+        ref_width = probe.textlength(ref_text, font=font_ref)
+        rx = (WIDTH - ref_width) // 2
+        ref_position = (rx, y)
+        shadow_draw.text(
+            (rx + SHADOW_OFFSET[0], y + SHADOW_OFFSET[1]), ref_text, font=font_ref, fill=(0, 0, 0, SHADOW_ALPHA)
+        )
+
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(SHADOW_BLUR_RADIUS))
     img = Image.alpha_composite(img, shadow_layer)
 
     draw = ImageDraw.Draw(img)
     for x, y, word, font in word_positions:
         draw.text((x, y), word, font=font, fill="white", stroke_width=3, stroke_fill="black")
+    if ref_position:
+        draw.text(ref_position, ref_text, font=font_ref, fill="white", stroke_width=2, stroke_fill="black")
 
     return img
 
