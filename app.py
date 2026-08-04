@@ -113,7 +113,14 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
             tailed_path = os.path.join(workdir, f"{uuid.uuid4().hex}_tailed.mp4")
             ig_thumb_offset_ms = _append_thumbnail_tail(output_path, thumb_img_path, tailed_path)
             output_path = tailed_path
-            thumbnail_url = req.custom_thumbnail_url
+            # Source thumbnails from the pendrive can be several MB (well past YouTube's 2MB
+            # thumbnail limit) -- re-encode a compressed JPEG copy for platform uploads instead
+            # of passing the raw file through.
+            compressed_path = os.path.join(workdir, "custom_thumb_compressed.jpg")
+            _compress_thumbnail(thumb_img_path, compressed_path)
+            thumbnail_url = _upload_to_supabase(
+                compressed_path, folder="thumbs/", ext=".jpg", content_type="image/jpeg"
+            )
         else:
             thumb_path = os.path.join(workdir, "thumb.jpg")
             if _extract_thumbnail(output_path, duration, thumb_path):
@@ -252,6 +259,32 @@ def _extract_thumbnail(video_path: str, duration: float, out_path: str) -> bool:
     cmd = ["ffmpeg", "-y", "-ss", str(offset), "-i", video_path, "-frames:v", "1", out_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0 and os.path.exists(out_path)
+
+
+THUMB_MAX_BYTES = 2 * 1024 * 1024  # YouTube's documented thumbnail upload limit
+THUMB_MAX_DIMENSION = 1280  # plenty for any platform's cover image, keeps file size well under the limit
+
+
+def _compress_thumbnail(src_path: str, out_path: str) -> None:
+    img = Image.open(src_path)
+    if img.mode in ("RGBA", "P", "LA"):
+        bg = Image.new("RGB", img.size, (0, 0, 0))
+        bg.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[-1])
+        img = bg
+    else:
+        img = img.convert("RGB")
+
+    if max(img.size) > THUMB_MAX_DIMENSION:
+        ratio = THUMB_MAX_DIMENSION / max(img.size)
+        img = img.resize((max(1, int(img.width * ratio)), max(1, int(img.height * ratio))), Image.LANCZOS)
+
+    quality = 90
+    while quality >= 40:
+        img.save(out_path, "JPEG", quality=quality)
+        if os.path.getsize(out_path) <= THUMB_MAX_BYTES:
+            return
+        quality -= 10
+    # last resort, whatever quality=40 produced is what we ship
 
 
 def _fold_accents(s: str) -> str:
