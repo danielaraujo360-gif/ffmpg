@@ -347,6 +347,17 @@ def _parse_srt(text: str) -> list[dict]:
         if caption_text and end > start:
             segments.append({"start": start, "end": end, "text": caption_text})
     segments.sort(key=lambda s: s["start"])
+
+    # Real ASR-generated .srt files commonly give each cue a generous window that overlaps the
+    # next one (e.g. cue N ends at 8.5s but cue N+1 already starts at 6.2s) -- meant for smooth
+    # continuous coverage, not simultaneous display. Rendered as-is, overlapping cues stack two
+    # captions on screen at once. Clip each cue's end to the next cue's start so only one line
+    # shows at a time.
+    for i in range(len(segments) - 1):
+        next_start = segments[i + 1]["start"]
+        if segments[i]["end"] > next_start:
+            segments[i]["end"] = next_start
+    segments = [s for s in segments if s["end"] > s["start"]]
     return segments
 
 
@@ -629,9 +640,15 @@ def _run_ffmpeg_video_source(
         concat_labels.append(f"[c{i}]")
     concat_filter = "".join(concat_labels) + f"concat=n={len(segments)}:v=1:a=0[rawv]"
 
+    # Each caption image only needs to exist for its own [start, end) window, not the whole
+    # video -- looping it for the full duration made ffmpeg decode/scale N full-length copies
+    # of the frame (N = number of captions), which is what made this take minutes instead of
+    # seconds. -itsoffset shifts the stream to start at the right time on the shared timeline;
+    # -t only needs to cover its own segment length.
     overlay_input_base = len(segments)
-    for op, _, _ in timed_overlays:
-        inputs += ["-loop", "1", "-t", str(duration), "-i", op]
+    for op, start, end in timed_overlays:
+        seg_len = max(end - start, 0.05)
+        inputs += ["-itsoffset", str(start), "-loop", "1", "-t", str(seg_len), "-i", op]
     music_input_idx = overlay_input_base + len(timed_overlays)
     inputs += ["-i", music_path]
 
