@@ -37,10 +37,12 @@ app = FastAPI()
 
 
 class RenderRequest(BaseModel):
-    style: str = "zoom"  # "zoom" (single image, Ken Burns) or "slideshow" (fast cuts across image_urls)
+    style: str = "zoom"  # "zoom" (single image, Ken Burns), "slideshow" (fast cuts), or "video" (real video clips)
     image_url: Optional[str] = None
     image_urls: Optional[List[str]] = None
     image_b64: Optional[str] = None
+    video_urls: Optional[List[str]] = None  # candidate real-video clips for style="video"
+    custom_thumbnail_url: Optional[str] = None  # skips auto frame-grab, uses this image as cover instead
     phrase: str
     highlight_word: Optional[str] = None
     verse_reference: Optional[str] = None
@@ -59,7 +61,9 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
 
     if req.style == "slideshow" and not req.image_urls:
         raise HTTPException(status_code=422, detail="image_urls is required for slideshow style")
-    if req.style != "slideshow" and not req.image_url and not req.image_b64:
+    if req.style == "video" and not req.video_urls:
+        raise HTTPException(status_code=422, detail="video_urls is required for video style")
+    if req.style not in ("slideshow", "video") and not req.image_url and not req.image_b64:
         raise HTTPException(status_code=422, detail="either image_url or image_b64 is required")
 
     workdir = tempfile.mkdtemp(prefix="render_")
@@ -82,6 +86,13 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
                 _download(url, p)
                 photo_paths.append(p)
             _run_ffmpeg_slideshow(photo_paths, overlay_path, music_path, output_path, duration)
+        elif req.style == "video":
+            clip_paths = []
+            for i, url in enumerate(req.video_urls):
+                p = os.path.join(workdir, f"clip_{i}" + _guess_ext(url))
+                _download(url, p)
+                clip_paths.append(p)
+            _run_ffmpeg_video_source(clip_paths, overlay_path, music_path, output_path, duration)
         else:
             bg_path = os.path.join(workdir, "bg.jpg")
             if req.image_b64:
@@ -91,15 +102,28 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
                 _download(req.image_url, bg_path)
             _run_ffmpeg(bg_path, overlay_path, music_path, output_path, duration)
 
-        video_url = _upload_to_supabase(output_path)
-        thumb_path = os.path.join(workdir, "thumb.jpg")
+        ig_thumb_offset_ms = int(THUMB_OFFSET_SECONDS * 1000)
         thumbnail_url = None
-        if _extract_thumbnail(output_path, duration, thumb_path):
-            thumbnail_url = _upload_to_supabase(
-                thumb_path, folder="thumbs/", ext=".jpg", content_type="image/jpeg"
-            )
+        if req.custom_thumbnail_url:
+            # Custom cover image: Facebook/YouTube accept it directly (returned as-is below).
+            # Instagram's API can only grab a frame FROM the video itself, so we append a
+            # near-invisible 0.1s tail showing this same image and point IG's thumb_offset there.
+            thumb_img_path = os.path.join(workdir, "custom_thumb" + _guess_ext(req.custom_thumbnail_url))
+            _download(req.custom_thumbnail_url, thumb_img_path)
+            tailed_path = os.path.join(workdir, f"{uuid.uuid4().hex}_tailed.mp4")
+            ig_thumb_offset_ms = _append_thumbnail_tail(output_path, thumb_img_path, tailed_path)
+            output_path = tailed_path
+            thumbnail_url = req.custom_thumbnail_url
+        else:
+            thumb_path = os.path.join(workdir, "thumb.jpg")
+            if _extract_thumbnail(output_path, duration, thumb_path):
+                thumbnail_url = _upload_to_supabase(
+                    thumb_path, folder="thumbs/", ext=".jpg", content_type="image/jpeg"
+                )
+
+        video_url = _upload_to_supabase(output_path)
         shutil.rmtree(workdir, ignore_errors=True)
-        return {"video_url": video_url, "thumbnail_url": thumbnail_url}
+        return {"video_url": video_url, "thumbnail_url": thumbnail_url, "ig_thumb_offset_ms": ig_thumb_offset_ms}
     except HTTPException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
@@ -444,3 +468,119 @@ def _run_ffmpeg_slideshow(
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=f"ffmpeg (slideshow concat) failed: {result.stderr[-2000:]}")
+
+
+def _run_ffmpeg_video_source(
+    video_paths: list[str], overlay_path: str, music_path: str, output_path: str, duration: float
+) -> None:
+    fade_dur = 1.2
+    text_start = fade_dur + 0.1
+    audio_fade_out_start = max(duration - 0.5, 0)
+    workdir = os.path.dirname(output_path)
+
+    # Probe each candidate clip's real duration and accumulate them (looping back through the
+    # candidate list if one pass isn't enough) until we have real footage covering the target
+    # duration, trimming the last clip used down to exactly what's left. Each used clip is
+    # first normalized into its own finite, silent segment -- same pre-materialize-then-concat
+    # pattern as the slideshow path, since ffmpeg handles many independent trims of a shared
+    # source unreliably.
+    segment_paths = []
+    accumulated = 0.0
+    idx = 0
+    guard = 0
+    while accumulated < duration and guard < len(video_paths) * 5 + 5:
+        guard += 1
+        src = video_paths[idx % len(video_paths)]
+        idx += 1
+        src_duration = _probe_duration(src)
+        remaining = duration - accumulated
+        clip_duration = min(src_duration, remaining)
+        if clip_duration <= 0.05:
+            continue
+        seg_path = os.path.join(workdir, f"vid_seg_{len(segment_paths)}.mp4")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", src,
+            "-t", str(clip_duration),
+            "-vf", f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},setsar=1",
+            "-an", "-r", "30",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            seg_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"ffmpeg (video segment {len(segment_paths)}) failed: {result.stderr[-1500:]}")
+        segment_paths.append(seg_path)
+        accumulated += clip_duration
+
+    if not segment_paths:
+        raise HTTPException(status_code=500, detail="no usable video segments to cover the audio duration")
+
+    concat_list_path = os.path.join(workdir, "concat_list_video.txt")
+    with open(concat_list_path, "w") as f:
+        for seg in segment_paths:
+            f.write(f"file '{seg}'\n")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0", "-i", concat_list_path,
+        "-loop", "1", "-t", str(duration), "-i", overlay_path,
+        "-i", music_path,
+        "-filter_complex",
+        f"[0:v]eq=contrast=1.18:brightness=-0.05:saturation=0.82,"
+        f"colorbalance=rs=0.05:gs=0:bs=-0.1,"
+        f"vignette=PI/3.5,"
+        f"fade=t=in:st=0:d={fade_dur}[bg];"
+        f"[bg][1:v]overlay=0:0:enable='gte(t,{text_start})'[outv]",
+        "-map", "[outv]", "-map", "2:a",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+        "-c:a", "aac", "-b:a", "128k",
+        "-af", f"afade=t=in:st=0:d=0.5,afade=t=out:st={audio_fade_out_start}:d=0.5",
+        "-t", str(duration),
+        output_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg (video concat) failed: {result.stderr[-2000:]}")
+
+
+def _append_thumbnail_tail(video_path: str, thumb_path: str, output_path: str) -> int:
+    # Appends a near-invisible 0.1s tail showing the custom thumbnail image, on the video
+    # stream only (the audio track stays at its original length -- players just go silent
+    # for that last 0.1s, imperceptible). Lets Instagram's thumb_offset -- which can only grab
+    # a frame FROM the video itself, never an arbitrary separate image -- point at a moment
+    # that actually IS the custom thumbnail. Returns the ms offset to use for thumb_offset.
+    workdir = os.path.dirname(output_path)
+    tail_duration = 0.1
+
+    main_duration = _probe_duration(video_path)
+
+    tail_path = os.path.join(workdir, "thumb_tail.mp4")
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-r", "30", "-i", thumb_path,
+        "-t", str(tail_duration),
+        "-vf", f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},setsar=1",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+        tail_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg (thumb tail) failed: {result.stderr[-1500:]}")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", tail_path,
+        "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[outv]",
+        "-map", "[outv]", "-map", "0:a",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg (thumb tail concat) failed: {result.stderr[-2000:]}")
+
+    return int((main_duration + tail_duration / 2) * 1000)
