@@ -344,6 +344,11 @@ def _parse_srt(text: str) -> list[dict]:
         end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
         caption_text = " ".join(lines[time_line_idx + 1:]).strip()
         caption_text = _TAG_RE.sub("", caption_text)
+        # Real ASR transcripts commonly leave in non-speech annotations ([música], [aplausos],
+        # [risos]...) and ">>" speaker-change markers -- neither is actual spoken text, strip both.
+        caption_text = re.sub(r"\[[^\]]*\]", "", caption_text)
+        caption_text = caption_text.replace(">>", "")
+        caption_text = re.sub(r"\s+", " ", caption_text).strip()
         if caption_text and end > start:
             segments.append({"start": start, "end": end, "text": caption_text})
     segments.sort(key=lambda s: s["start"])
