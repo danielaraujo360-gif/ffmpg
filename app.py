@@ -1,5 +1,6 @@
 import base64
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -42,6 +43,7 @@ class RenderRequest(BaseModel):
     image_urls: Optional[List[str]] = None
     image_b64: Optional[str] = None
     video_urls: Optional[List[str]] = None  # candidate real-video clips for style="video"
+    srt_url: Optional[str] = None  # real timed captions for style="video" -- overrides phrase/highlight_word on-screen
     custom_thumbnail_url: Optional[str] = None  # skips auto frame-grab, uses this image as cover instead
     phrase: str
     highlight_word: Optional[str] = None
@@ -92,7 +94,30 @@ def render(req: RenderRequest, x_api_key: str = Header(default="")):
                 p = os.path.join(workdir, f"clip_{i}" + _guess_ext(url))
                 _download(url, p)
                 clip_paths.append(p)
-            _run_ffmpeg_video_source(clip_paths, overlay_path, music_path, output_path, duration)
+
+            timed_overlays = None
+            if req.srt_url:
+                # Real on-screen captions synced to what's actually being said in the audio,
+                # instead of the LLM-generated phrase (which has nothing to do with this
+                # particular audio track) -- same font/highlight-word visual treatment as
+                # before, just timed per caption line instead of one static phrase.
+                srt_path = os.path.join(workdir, "captions.srt")
+                _download(req.srt_url, srt_path)
+                with open(srt_path, encoding="utf-8", errors="ignore") as f:
+                    srt_segments = _parse_srt(f.read())
+                built_overlays = []
+                for i, seg in enumerate(srt_segments):
+                    if seg["start"] >= duration:
+                        break
+                    seg_overlay_path = os.path.join(workdir, f"caption_{i}.png")
+                    _create_text_overlay(seg["text"], _pick_highlight_word(seg["text"])).save(seg_overlay_path)
+                    built_overlays.append((seg_overlay_path, seg["start"], min(seg["end"], duration)))
+                if built_overlays:
+                    timed_overlays = built_overlays
+                # if the .srt failed to parse into anything usable, timed_overlays stays None
+                # and _run_ffmpeg_video_source falls back to the single static phrase overlay.
+
+            _run_ffmpeg_video_source(clip_paths, overlay_path, music_path, output_path, duration, timed_overlays)
         else:
             bg_path = os.path.join(workdir, "bg.jpg")
             if req.image_b64:
@@ -285,6 +310,56 @@ def _compress_thumbnail(src_path: str, out_path: str) -> None:
             return
         quality -= 10
     # last resort, whatever quality=40 produced is what we ship
+
+
+_SRT_TIME_RE = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})"
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+_PT_STOPWORDS = {
+    "de", "da", "do", "das", "dos", "que", "um", "uma", "uns", "umas", "e", "a", "o", "as", "os",
+    "em", "no", "na", "nos", "nas", "para", "por", "com", "se", "sua", "seu", "suas", "seus",
+    "ao", "aos", "a", "as", "nao", "mais", "mas", "como", "ja", "tem", "vai", "vou", "voce",
+    "eu", "ele", "ela", "nos", "isso", "essa", "esse", "muito", "so", "ta", "pra", "pro", "que",
+    "quem", "quando", "onde", "porque", "entao", "la", "aqui", "sao", "foi", "ser", "estar",
+}
+
+
+def _parse_srt(text: str) -> list[dict]:
+    # Standard .srt format: blocks of "index\nHH:MM:SS,mmm --> HH:MM:SS,mmm\ntext...", separated
+    # by a blank line. Tolerates the timestamp using either a comma or a dot before milliseconds,
+    # and strips any inline HTML-ish styling tags (<i>, <b>, etc) some downloaders leave in.
+    blocks = re.split(r"\n\s*\n", text.strip())
+    segments = []
+    for block in blocks:
+        lines = [l for l in block.strip().split("\n") if l.strip()]
+        time_line_idx = next((i for i, l in enumerate(lines) if "-->" in l), None)
+        if time_line_idx is None:
+            continue
+        m = _SRT_TIME_RE.search(lines[time_line_idx])
+        if not m:
+            continue
+        h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(g) for g in m.groups())
+        start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000
+        end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
+        caption_text = " ".join(lines[time_line_idx + 1:]).strip()
+        caption_text = _TAG_RE.sub("", caption_text)
+        if caption_text and end > start:
+            segments.append({"start": start, "end": end, "text": caption_text})
+    segments.sort(key=lambda s: s["start"])
+    return segments
+
+
+def _pick_highlight_word(text: str) -> Optional[str]:
+    # No LLM-picked highlight word exists for real transcript captions -- approximate the same
+    # "one emphasized word per line" visual style with a simple, free heuristic instead: the
+    # longest word that isn't a common stopword. Not always the objectively best choice, but
+    # keeps the same look without an extra paid call for what's just a formatting/emphasis detail.
+    words = [w.strip(".,!?;:\"'()") for w in text.split()]
+    candidates = [w for w in words if w and len(w) > 2 and _fold_accents(w).lower() not in _PT_STOPWORDS]
+    if not candidates:
+        return None
+    return max(candidates, key=len)
 
 
 def _fold_accents(s: str) -> str:
@@ -504,20 +579,25 @@ def _run_ffmpeg_slideshow(
 
 
 def _run_ffmpeg_video_source(
-    video_paths: list[str], overlay_path: str, music_path: str, output_path: str, duration: float
+    video_paths: list[str], overlay_path: str, music_path: str, output_path: str, duration: float,
+    timed_overlays: Optional[list[tuple[str, float, float]]] = None,
 ) -> None:
     fade_dur = 1.2
     text_start = fade_dur + 0.1
     audio_fade_out_start = max(duration - 0.5, 0)
-    workdir = os.path.dirname(output_path)
 
-    # Probe each candidate clip's real duration and accumulate them (looping back through the
-    # candidate list if one pass isn't enough) until we have real footage covering the target
-    # duration, trimming the last clip used down to exactly what's left. Each used clip is
-    # first normalized into its own finite, silent segment -- same pre-materialize-then-concat
-    # pattern as the slideshow path, since ffmpeg handles many independent trims of a shared
-    # source unreliably.
-    segment_paths = []
+    # (overlay_image_path, start_seconds, end_seconds) for each caption to show, in order.
+    # Defaults to the single static overlay shown for the whole clip (the original behavior).
+    if timed_overlays is None:
+        timed_overlays = [(overlay_path, text_start, duration)]
+
+    # Figure out which candidate clips to use (looping the pool if one pass isn't enough) and how
+    # much of each, to cover the target duration exactly. Trimmed/scaled/concatenated in a single
+    # filter_complex pass, rather than pre-encoding each clip to its own file first and then
+    # re-encoding *again* on concat -- that extra encode pass was visibly softening real video
+    # footage (unlike a still photo, real video has much more fine detail/motion to lose from a
+    # second lossy pass).
+    segments = []  # (path, clip_duration)
     accumulated = 0.0
     idx = 0
     guard = 0
@@ -530,43 +610,57 @@ def _run_ffmpeg_video_source(
         clip_duration = min(src_duration, remaining)
         if clip_duration <= 0.05:
             continue
-        seg_path = os.path.join(workdir, f"vid_seg_{len(segment_paths)}.mp4")
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", src,
-            "-t", str(clip_duration),
-            "-vf", f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},setsar=1",
-            "-an", "-r", "30",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            seg_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"ffmpeg (video segment {len(segment_paths)}) failed: {result.stderr[-1500:]}")
-        segment_paths.append(seg_path)
+        segments.append((src, clip_duration))
         accumulated += clip_duration
 
-    if not segment_paths:
+    if not segments:
         raise HTTPException(status_code=500, detail="no usable video segments to cover the audio duration")
 
-    concat_list_path = os.path.join(workdir, "concat_list_video.txt")
-    with open(concat_list_path, "w") as f:
-        for seg in segment_paths:
-            f.write(f"file '{seg}'\n")
+    inputs = []
+    trim_filters = []
+    concat_labels = []
+    for i, (path, clip_duration) in enumerate(segments):
+        inputs += ["-i", path]
+        trim_filters.append(
+            f"[{i}:v]trim=duration={clip_duration},setpts=PTS-STARTPTS,"
+            f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
+            f"crop={WIDTH}:{HEIGHT},setsar=1,fps=30[c{i}]"
+        )
+        concat_labels.append(f"[c{i}]")
+    concat_filter = "".join(concat_labels) + f"concat=n={len(segments)}:v=1:a=0[rawv]"
+
+    overlay_input_base = len(segments)
+    for op, _, _ in timed_overlays:
+        inputs += ["-loop", "1", "-t", str(duration), "-i", op]
+    music_input_idx = overlay_input_base + len(timed_overlays)
+    inputs += ["-i", music_path]
+
+    grade_filter = (
+        f"[rawv]eq=contrast=1.18:brightness=-0.05:saturation=0.82,"
+        f"colorbalance=rs=0.05:gs=0:bs=-0.1,"
+        f"vignette=PI/3.5,"
+        f"fade=t=in:st=0:d={fade_dur}[bg0]"
+    )
+
+    overlay_chain = []
+    prev_label = "bg0"
+    n_overlays = len(timed_overlays)
+    for oi, (_, start, end) in enumerate(timed_overlays):
+        in_idx = overlay_input_base + oi
+        out_label = "outv" if oi == n_overlays - 1 else f"bg{oi + 1}"
+        overlay_chain.append(
+            f"[{prev_label}][{in_idx}:v]overlay=0:0:enable='between(t,{start},{end})'[{out_label}]"
+        )
+        prev_label = out_label
+
+    filter_complex = ";".join(trim_filters + [concat_filter, grade_filter] + overlay_chain)
 
     cmd = [
         "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0", "-i", concat_list_path,
-        "-loop", "1", "-t", str(duration), "-i", overlay_path,
-        "-i", music_path,
-        "-filter_complex",
-        f"[0:v]eq=contrast=1.18:brightness=-0.05:saturation=0.82,"
-        f"colorbalance=rs=0.05:gs=0:bs=-0.1,"
-        f"vignette=PI/3.5,"
-        f"fade=t=in:st=0:d={fade_dur}[bg];"
-        f"[bg][1:v]overlay=0:0:enable='gte(t,{text_start})'[outv]",
-        "-map", "[outv]", "-map", "2:a",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]", "-map", f"{music_input_idx}:a",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30", "-crf", "18",
         "-c:a", "aac", "-b:a", "128k",
         "-af", f"afade=t=in:st=0:d=0.5,afade=t=out:st={audio_fade_out_start}:d=0.5",
         "-t", str(duration),
