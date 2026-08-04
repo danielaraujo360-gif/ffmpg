@@ -589,6 +589,9 @@ def _run_ffmpeg_slideshow(
         raise HTTPException(status_code=500, detail=f"ffmpeg (slideshow concat) failed: {result.stderr[-2000:]}")
 
 
+VIDEO_BATCH_SECONDS = 8.0  # keeps each ffmpeg call's peak memory bounded (see _run_ffmpeg_video_source)
+
+
 def _run_ffmpeg_video_source(
     video_paths: list[str], overlay_path: str, music_path: str, output_path: str, duration: float,
     timed_overlays: Optional[list[tuple[str, float, float]]] = None,
@@ -596,6 +599,7 @@ def _run_ffmpeg_video_source(
     fade_dur = 1.2
     text_start = fade_dur + 0.1
     audio_fade_out_start = max(duration - 0.5, 0)
+    workdir = os.path.dirname(output_path)
 
     # (overlay_image_path, start_seconds, end_seconds) for each caption to show, in order.
     # Defaults to the single static overlay shown for the whole clip (the original behavior).
@@ -603,11 +607,7 @@ def _run_ffmpeg_video_source(
         timed_overlays = [(overlay_path, text_start, duration)]
 
     # Figure out which candidate clips to use (looping the pool if one pass isn't enough) and how
-    # much of each, to cover the target duration exactly. Trimmed/scaled/concatenated in a single
-    # filter_complex pass, rather than pre-encoding each clip to its own file first and then
-    # re-encoding *again* on concat -- that extra encode pass was visibly softening real video
-    # footage (unlike a still photo, real video has much more fine detail/motion to lose from a
-    # second lossy pass).
+    # much of each, to cover the target duration exactly.
     segments = []  # (path, clip_duration)
     accumulated = 0.0
     idx = 0
@@ -627,66 +627,121 @@ def _run_ffmpeg_video_source(
     if not segments:
         raise HTTPException(status_code=500, detail="no usable video segments to cover the audio duration")
 
-    inputs = []
-    trim_filters = []
-    concat_labels = []
-    for i, (path, clip_duration) in enumerate(segments):
-        inputs += ["-i", path]
-        trim_filters.append(
-            f"[{i}:v]trim=duration={clip_duration},setpts=PTS-STARTPTS,"
-            f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
-            f"crop={WIDTH}:{HEIGHT},setsar=1,fps=30[c{i}]"
-        )
-        concat_labels.append(f"[c{i}]")
-    concat_filter = "".join(concat_labels) + f"concat=n={len(segments)}:v=1:a=0[rawv]"
+    # absolute [seg_start, seg_end) on the shared timeline for each source clip
+    abs_segments = []
+    t = 0.0
+    for path, clip_duration in segments:
+        abs_segments.append((path, t, t + clip_duration))
+        t += clip_duration
 
-    # Each caption image only needs to exist for its own [start, end) window, not the whole
-    # video -- looping it for the full duration made ffmpeg decode/scale N full-length copies
-    # of the frame (N = number of captions), which is what made this take minutes instead of
-    # seconds. -itsoffset shifts the stream to start at the right time on the shared timeline;
-    # -t only needs to cover its own segment length.
-    overlay_input_base = len(segments)
-    for op, start, end in timed_overlays:
-        seg_len = max(end - start, 0.05)
-        inputs += ["-itsoffset", str(start), "-loop", "1", "-t", str(seg_len), "-i", op]
-    music_input_idx = overlay_input_base + len(timed_overlays)
-    inputs += ["-i", music_path]
+    # Rendered in fixed-size time batches (~8s each) instead of one filter_complex spanning the
+    # whole video with every caption image as a simultaneous input. Chaining 20+ caption overlays
+    # (each its own decoded/looped image stream) in a single graph pushed peak memory high enough
+    # to get OOM-killed on the production host. Batching bounds how many caption images and video
+    # clips any single ffmpeg process has open at once (usually 1 clip + 2-4 captions), while still
+    # encoding every frame exactly once -- no intermediate re-encode, so no extra quality loss.
+    batch_paths = []
+    n_batches = max(1, int(duration // VIDEO_BATCH_SECONDS) + (1 if duration % VIDEO_BATCH_SECONDS > 0.05 else 0))
+    for bi in range(n_batches):
+        bstart = bi * VIDEO_BATCH_SECONDS
+        bend = min(bstart + VIDEO_BATCH_SECONDS, duration)
+        if bend - bstart <= 0.05:
+            continue
 
-    grade_filter = (
-        f"[rawv]eq=contrast=1.18:brightness=-0.05:saturation=0.82,"
-        f"colorbalance=rs=0.05:gs=0:bs=-0.1,"
-        f"vignette=PI/3.5,"
-        f"fade=t=in:st=0:d={fade_dur}[bg0]"
-    )
+        inputs = []
+        trim_filters = []
+        concat_labels = []
+        ci = 0
+        for path, seg_start, seg_end in abs_segments:
+            ov_start = max(seg_start, bstart)
+            ov_end = min(seg_end, bend)
+            if ov_end - ov_start <= 0.02:
+                continue
+            local_start = ov_start - seg_start
+            local_dur = ov_end - ov_start
+            inputs += ["-i", path]
+            trim_filters.append(
+                f"[{ci}:v]trim=start={local_start}:duration={local_dur},setpts=PTS-STARTPTS,"
+                f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
+                f"crop={WIDTH}:{HEIGHT},setsar=1,fps=30[c{ci}]"
+            )
+            concat_labels.append(f"[c{ci}]")
+            ci += 1
+        concat_filter = "".join(concat_labels) + f"concat=n={ci}:v=1:a=0[rawv]"
 
-    overlay_chain = []
-    prev_label = "bg0"
-    n_overlays = len(timed_overlays)
-    for oi, (_, start, end) in enumerate(timed_overlays):
-        in_idx = overlay_input_base + oi
-        out_label = "outv" if oi == n_overlays - 1 else f"bg{oi + 1}"
-        overlay_chain.append(
-            f"[{prev_label}][{in_idx}:v]overlay=0:0:enable='between(t,{start},{end})'[{out_label}]"
-        )
-        prev_label = out_label
+        grade_parts = "eq=contrast=1.18:brightness=-0.05:saturation=0.82,colorbalance=rs=0.05:gs=0:bs=-0.1,vignette=PI/3.5"
+        if bi == 0:
+            grade_filter = f"[rawv]{grade_parts},fade=t=in:st=0:d={fade_dur}[bg0]"
+        else:
+            grade_filter = f"[rawv]{grade_parts}[bg0]"
 
-    filter_complex = ";".join(trim_filters + [concat_filter, grade_filter] + overlay_chain)
+        batch_overlays = [
+            (op, max(start, bstart) - bstart, min(end, bend) - bstart)
+            for op, start, end in timed_overlays
+            if end > bstart and start < bend
+        ]
+
+        overlay_input_base = ci
+        for op, local_start, local_end in batch_overlays:
+            seg_len = max(local_end - local_start, 0.05)
+            inputs += ["-itsoffset", str(local_start), "-loop", "1", "-t", str(seg_len), "-i", op]
+
+        overlay_chain = []
+        prev_label = "bg0"
+        n_overlays = len(batch_overlays)
+        for oi, (_, local_start, local_end) in enumerate(batch_overlays):
+            in_idx = overlay_input_base + oi
+            out_label = "outv" if oi == n_overlays - 1 else f"bg{oi + 1}"
+            overlay_chain.append(
+                f"[{prev_label}][{in_idx}:v]overlay=0:0:enable='between(t,{local_start},{local_end})'[{out_label}]"
+            )
+            prev_label = out_label
+        if n_overlays == 0:
+            # no caption active anywhere in this batch -- rename bg0 straight to outv
+            overlay_chain.append(f"[bg0]null[outv]")
+
+        filter_complex = ";".join(trim_filters + [concat_filter, grade_filter] + overlay_chain)
+        batch_path = os.path.join(workdir, f"video_batch_{bi}.mp4")
+        cmd = [
+            "ffmpeg", "-y",
+            *inputs,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30", "-crf", "18",
+            "-t", str(bend - bstart),
+            batch_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"ffmpeg (video batch {bi}) failed: {result.stderr[-2000:]}")
+        batch_paths.append(batch_path)
+
+    concat_list_path = os.path.join(workdir, "video_batches_list.txt")
+    with open(concat_list_path, "w") as f:
+        for p in batch_paths:
+            f.write(f"file '{p}'\n")
+
+    silent_video_path = os.path.join(workdir, "video_silent.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path,
+        "-c", "copy", silent_video_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg (video batch concat) failed: {result.stderr[-2000:]}")
 
     cmd = [
-        "ffmpeg", "-y",
-        *inputs,
-        "-filter_complex", filter_complex,
-        "-map", "[outv]", "-map", f"{music_input_idx}:a",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30", "-crf", "18",
+        "ffmpeg", "-y", "-i", silent_video_path, "-i", music_path,
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "copy",
         "-c:a", "aac", "-b:a", "128k",
         "-af", f"afade=t=in:st=0:d=0.5,afade=t=out:st={audio_fade_out_start}:d=0.5",
         "-t", str(duration),
         output_path,
     ]
-
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"ffmpeg (video concat) failed: {result.stderr[-2000:]}")
+        raise HTTPException(status_code=500, detail=f"ffmpeg (audio mux) failed: {result.stderr[-2000:]}")
 
 
 def _append_thumbnail_tail(video_path: str, thumb_path: str, output_path: str) -> int:
