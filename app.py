@@ -8,7 +8,7 @@ import uuid
 from typing import List, Optional
 
 import requests
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from pydantic import BaseModel
 
@@ -142,6 +142,36 @@ def extract_audio(req: ExtractAudioRequest, x_api_key: str = Header(default=""))
     except Exception as e:
         shutil.rmtree(workdir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/upload-raw")
+async def upload_raw(
+    request: Request,
+    folder: str = Query(...),
+    ext: str = Query(...),
+    content_type: str = Query(default="application/octet-stream"),
+    x_api_key: str = Header(default=""),
+):
+    # Lets n8n (or any caller) push a raw file straight into Supabase Storage without
+    # needing Supabase's own service-role secret -- this service already holds it correctly
+    # (SUPABASE_SERVICE_KEY env var) and its _upload_to_supabase() helper sends both the
+    # apikey and Authorization headers Supabase's object-create endpoint actually requires.
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=422, detail="empty body")
+
+    workdir = tempfile.mkdtemp(prefix="uploadraw_")
+    try:
+        tmp_path = os.path.join(workdir, f"file{ext}")
+        with open(tmp_path, "wb") as f:
+            f.write(body)
+        url = _upload_to_supabase(tmp_path, folder=folder, ext=ext, content_type=content_type)
+        return {"url": url}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _upload_to_supabase(
